@@ -1,14 +1,215 @@
 #include "uproxy/proxy.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstring>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace uproxy {
+
+namespace {
+
+constexpr size_t MAX_PROXY_RESPONSE_BYTES = 64U * 1024U * 1024U;
+
+bool header_name_eq(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Result<void> wait_fd(int fd, short event, int timeout_ms, std::string_view op) {
+    pollfd pfd{fd, event, 0};
+    for (;;) {
+        const int rc = ::poll(&pfd, 1, timeout_ms);
+        if (rc > 0) {
+            if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 && (pfd.revents & event) == 0) {
+                return Result<void>::err(Error::from_code(ErrCode::SysError, op));
+            }
+            return Result<void>::ok();
+        }
+        if (rc == 0) {
+            return Result<void>::err(Error::from_code(ErrCode::Timeout, op));
+        }
+        if (errno != EINTR) {
+            return Result<void>::err(Error::from_errno(op));
+        }
+    }
+}
+
+Result<Uniquefd> connect_upstream(const UpstreamEndpoint& upstream, uint32_t timeout_ms) {
+    Uniquefd fd(::socket(AF_INET, SOCK_STREAM, 0));
+    if (!fd.valid()) {
+        return Result<Uniquefd>::err(Error::from_errno("socket upstream"));
+    }
+    auto nb = fd.set_nonblocking();
+    if (nb.is_err()) {
+        return Result<Uniquefd>::err(nb.error());
+    }
+    (void)fd.set_nodelay();
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(upstream.port);
+    if (::inet_pton(AF_INET, upstream.addr.c_str(), &addr.sin_addr) != 1) {
+        return Result<Uniquefd>::err(
+            Error::from_code(ErrCode::ConfigInvalid, "upstream address must be IPv4"));
+    }
+
+    const int rc = ::connect(fd.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc == 0) {
+        return Result<Uniquefd>::ok(std::move(fd));
+    }
+    if (errno != EINPROGRESS) {
+        return Result<Uniquefd>::err(Error::from_errno("connect upstream"));
+    }
+    auto waited = wait_fd(fd.get(), POLLOUT, static_cast<int>(timeout_ms), "connect upstream");
+    if (waited.is_err()) {
+        return Result<Uniquefd>::err(waited.error());
+    }
+    int so_error = 0;
+    socklen_t len = sizeof(so_error);
+    if (::getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) {
+        return Result<Uniquefd>::err(Error::from_errno("getsockopt(SO_ERROR)"));
+    }
+    if (so_error != 0) {
+        Error e;
+        e.code = ErrCode::SysError;
+        e.sys_errno = so_error;
+        e.msg = "connect upstream";
+        return Result<Uniquefd>::err(std::move(e));
+    }
+    return Result<Uniquefd>::ok(std::move(fd));
+}
+
+Result<void> write_all(int fd, std::span<const unsigned char> bytes, uint32_t timeout_ms) {
+    size_t off = 0;
+    while (off < bytes.size()) {
+        const ssize_t n = ::send(fd, bytes.data() + off, bytes.size() - off, 0);
+        if (n > 0) {
+            off += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            auto waited = wait_fd(fd, POLLOUT, static_cast<int>(timeout_ms), "write upstream");
+            if (waited.is_err()) {
+                return waited;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return Result<void>::err(Error::from_errno("write upstream"));
+    }
+    return Result<void>::ok();
+}
+
+bool response_complete(const RingBuffer& response, HttpResponse& parsed) {
+    Http1Parser parser;
+    const ParseResult status = parser.parse_response(response, parsed);
+    if (status != ParseResult::Complete) {
+        return false;
+    }
+    if (parsed.chunked) {
+        const auto bytes = response.peek(response.readable());
+        const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        return text.find("\r\n0\r\n\r\n", parsed.header_bytes) != std::string_view::npos ||
+               text.find("\r\n0;") != std::string_view::npos;
+    }
+    const bool has_content_length = std::ranges::any_of(parsed.headers, [](const HttpHeader& h) {
+        return header_name_eq(h.name, "content-length");
+    });
+    if (has_content_length) {
+        return response.readable() >= parsed.header_bytes + parsed.content_length;
+    }
+    return parsed.status == 204 || parsed.status == 304;
+}
+
+Result<std::vector<unsigned char>> read_response(int fd, uint32_t timeout_ms) {
+    RingBuffer response(65536);
+    HttpResponse parsed;
+    for (;;) {
+        if (response_complete(response, parsed)) {
+            return Result<std::vector<unsigned char>>::ok(response.peek(response.readable()));
+        }
+        if (response.readable() >= MAX_PROXY_RESPONSE_BYTES) {
+            return Result<std::vector<unsigned char>>::err(
+                Error::from_code(ErrCode::HttpMalformed, "upstream response too large"));
+        }
+        auto waited = wait_fd(fd, POLLIN, static_cast<int>(timeout_ms), "read upstream");
+        if (waited.is_err()) {
+            if (parsed.header_bytes > 0 && parsed.content_length == 0 && !parsed.chunked) {
+                return Result<std::vector<unsigned char>>::ok(response.peek(response.readable()));
+            }
+            return Result<std::vector<unsigned char>>::err(waited.error());
+        }
+        unsigned char tmp[16384];
+        const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (n > 0) {
+            auto appended =
+                response.append(std::span<const unsigned char>(tmp, static_cast<size_t>(n)));
+            if (appended.is_err()) {
+                return Result<std::vector<unsigned char>>::err(appended.error());
+            }
+            continue;
+        }
+        if (n == 0) {
+            return Result<std::vector<unsigned char>>::ok(response.peek(response.readable()));
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            continue;
+        }
+        return Result<std::vector<unsigned char>>::err(Error::from_errno("read upstream"));
+    }
+}
+
+std::string upstream_host(const UpstreamEndpoint& upstream) {
+    return upstream.addr + ":" + std::to_string(upstream.port);
+}
+
+Result<std::vector<unsigned char>> forward_http1(const HttpRequest& req,
+                                                 std::span<const unsigned char> body,
+                                                 const UpstreamEndpoint& upstream,
+                                                 const PoolConfig& pool) {
+    RingBuffer upstream_request(65536 + body.size());
+    Http1Serializer serializer;
+    auto serialized = serializer.write_request(upstream_request, req, upstream_host(upstream));
+    if (serialized.is_err()) {
+        return Result<std::vector<unsigned char>>::err(serialized.error());
+    }
+    if (!body.empty()) {
+        auto appended = upstream_request.append(body);
+        if (appended.is_err()) {
+            return Result<std::vector<unsigned char>>::err(appended.error());
+        }
+    }
+    auto connected = connect_upstream(upstream, pool.connect_timeout_ms);
+    if (connected.is_err()) {
+        return Result<std::vector<unsigned char>>::err(connected.error());
+    }
+    Uniquefd upstream_fd = std::move(connected).value();
+    const auto request_bytes = upstream_request.peek(upstream_request.readable());
+    auto wrote = write_all(upstream_fd.get(), request_bytes, pool.connect_timeout_ms);
+    if (wrote.is_err()) {
+        return Result<std::vector<unsigned char>>::err(wrote.error());
+    }
+    return read_response(upstream_fd.get(), pool.connect_timeout_ms);
+}
+
+} // namespace
 
 std::atomic<bool> ProxyServer::g_shutdown{false};
 
@@ -151,7 +352,15 @@ void ProxyServer::on_client_event(int fd, Event events) {
             return;
         }
         if (parsed == ParseResult::Complete) {
+            const size_t buffered_body = conn.rbuf.readable() > req.header_bytes
+                                             ? conn.rbuf.readable() - req.header_bytes
+                                             : 0;
+            if (req.content_length > buffered_body) {
+                return;
+            }
             conn.rbuf.commit_read(req.header_bytes);
+            const auto body = conn.rbuf.peek(static_cast<size_t>(req.content_length));
+            conn.rbuf.commit_read(static_cast<size_t>(req.content_length));
             auto upstream = lb_.next();
             if (upstream == nullptr) {
                 static constexpr std::string_view unavailable =
@@ -161,9 +370,18 @@ void ProxyServer::on_client_event(int fd, Event events) {
                 conn.keep_alive = false;
             } else {
                 conn.upstream = upstream;
-                std::string body =
-                    "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                (void)conn.wbuf.append(body);
+                auto response = forward_http1(req, body, *upstream, cfg_.pool);
+                if (response.is_err()) {
+                    upstream->failed_requests.fetch_add(1);
+                    LOG_WARN("upstream request failed", "upstream", upstream->name, "error",
+                             response.error().to_string());
+                    static constexpr std::string_view bad_gateway =
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: "
+                        "close\r\n\r\n";
+                    (void)conn.wbuf.append(bad_gateway);
+                } else {
+                    (void)conn.wbuf.append(std::move(response).value());
+                }
                 conn.keep_alive = false;
             }
             (void)loop_->modify(fd, Event::Read | Event::Write, &conn);

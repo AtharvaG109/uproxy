@@ -1,11 +1,11 @@
 #include "uproxy/log.h"
 
-#include <cassert>
+#include "test_util.h"
 
 using namespace uproxy;
 
 int main_log_tests() {
-    assert(parse_log_level("debug") == LogLevel::Debug);
-    assert(log_level_name(LogLevel::Warn) == "warn");
+    check(parse_log_level("debug") == LogLevel::Debug);
+    check(log_level_name(LogLevel::Warn) == "warn");
     return 0;
 }

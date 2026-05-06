@@ -1,6 +1,7 @@
 #include "uproxy/load_balancer.h"
 
-#include <cassert>
+#include "test_util.h"
+
 #include <vector>
 
 using namespace uproxy;
@@ -14,6 +15,6 @@ int main_load_balancer_tests() {
     for (int i = 0; i < 10; ++i) {
         seq.push_back(lb.next()->name);
     }
-    assert((seq == std::vector<std::string>{"A", "B", "C", "A", "A", "B", "A", "C", "B", "A"}));
+    check((seq == std::vector<std::string>{"A", "B", "C", "A", "A", "B", "A", "C", "B", "A"}));
     return 0;
 }

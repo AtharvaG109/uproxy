@@ -8,6 +8,8 @@ add_executable(uproxy_tests
     test_config.cpp
     test_load_balancer.cpp
     test_log.cpp
+    test_util.h
 )
 target_link_libraries(uproxy_tests PRIVATE uproxy_core)
+uproxy_apply_options(uproxy_tests)
 add_test(NAME uproxy_tests COMMAND uproxy_tests)

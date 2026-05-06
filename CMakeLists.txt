@@ -9,29 +9,39 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-add_compile_options(
-    -Wall -Wextra -Wpedantic -Wshadow -Wconversion -fno-omit-frame-pointer
-)
-
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_options(-O0 -g)
-endif()
-
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_compile_options(-O2 -DNDEBUG)
-endif()
-
 option(ENABLE_ASAN "Build with AddressSanitizer + UBSan" OFF)
-if(ENABLE_ASAN)
-    add_compile_options(-fsanitize=address,undefined -g)
-    add_link_options(-fsanitize=address,undefined)
+option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+
+set(UPROXY_COMPILE_OPTIONS
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wshadow
+    -Wconversion
+    -fno-omit-frame-pointer
+)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    list(APPEND UPROXY_COMPILE_OPTIONS -O0 -g)
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+    list(APPEND UPROXY_COMPILE_OPTIONS -O2 -DNDEBUG)
 endif()
 
-option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
-if(ENABLE_TSAN)
-    add_compile_options(-fsanitize=thread -g)
-    add_link_options(-fsanitize=thread)
+set(UPROXY_LINK_OPTIONS)
+if(ENABLE_ASAN)
+    list(APPEND UPROXY_COMPILE_OPTIONS -fsanitize=address,undefined -g)
+    list(APPEND UPROXY_LINK_OPTIONS -fsanitize=address,undefined)
 endif()
+if(ENABLE_TSAN)
+    list(APPEND UPROXY_COMPILE_OPTIONS -fsanitize=thread -g)
+    list(APPEND UPROXY_LINK_OPTIONS -fsanitize=thread)
+endif()
+
+function(uproxy_apply_options target_name)
+    target_compile_options(${target_name} PRIVATE ${UPROXY_COMPILE_OPTIONS})
+    if(UPROXY_LINK_OPTIONS)
+        target_link_options(${target_name} PRIVATE ${UPROXY_LINK_OPTIONS})
+    endif()
+endfunction()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(PLATFORM_SRCS src/event_loop_epoll.cpp)
@@ -61,6 +71,7 @@ set(UPROXY_SRCS
 
 add_library(uproxy_core STATIC ${UPROXY_SRCS})
 target_include_directories(uproxy_core PUBLIC include)
+uproxy_apply_options(uproxy_core)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/boringssl/CMakeLists.txt")
     add_subdirectory(third_party/boringssl)
@@ -77,10 +88,10 @@ endif()
 
 add_executable(uproxy src/main.cpp)
 target_link_libraries(uproxy PRIVATE uproxy_core)
+uproxy_apply_options(uproxy)
 
 option(BUILD_TESTS "Build test suite" ON)
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
-

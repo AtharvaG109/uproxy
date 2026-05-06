@@ -1,6 +1,6 @@
 #include "uproxy/result.h"
 
-#include <cassert>
+#include "test_util.h"
 
 using namespace uproxy;
 
@@ -14,11 +14,11 @@ Result<int> double_positive(int x) {
 }
 
 void test_result() {
-    assert(Result<int>::ok(42).value() == 42);
-    assert(Result<int>::err(Error::from_code(ErrCode::Timeout)).is_err());
-    assert(Result<int>::ok(5).map([](int x) { return x * 2; }).value() == 10);
-    assert(Result<int>::ok(5).and_then(double_positive).value() == 10);
-    assert(Result<int>::ok(-1).and_then(double_positive).is_err());
+    check(Result<int>::ok(42).value() == 42);
+    check(Result<int>::err(Error::from_code(ErrCode::Timeout)).is_err());
+    check(Result<int>::ok(5).map([](int x) { return x * 2; }).value() == 10);
+    check(Result<int>::ok(5).and_then(double_positive).value() == 10);
+    check(Result<int>::ok(-1).and_then(double_positive).is_err());
 }
 
 } // namespace
