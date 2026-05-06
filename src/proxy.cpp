@@ -1,4 +1,5 @@
 #include "uproxy/proxy.h"
+#include "uproxy/http2.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -49,50 +50,6 @@ Result<void> wait_fd(int fd, short event, int timeout_ms, std::string_view op) {
     }
 }
 
-Result<Uniquefd> connect_upstream(const UpstreamEndpoint& upstream, uint32_t timeout_ms) {
-    Uniquefd fd(::socket(AF_INET, SOCK_STREAM, 0));
-    if (!fd.valid()) {
-        return Result<Uniquefd>::err(Error::from_errno("socket upstream"));
-    }
-    auto nb = fd.set_nonblocking();
-    if (nb.is_err()) {
-        return Result<Uniquefd>::err(nb.error());
-    }
-    (void)fd.set_nodelay();
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(upstream.port);
-    if (::inet_pton(AF_INET, upstream.addr.c_str(), &addr.sin_addr) != 1) {
-        return Result<Uniquefd>::err(
-            Error::from_code(ErrCode::ConfigInvalid, "upstream address must be IPv4"));
-    }
-
-    const int rc = ::connect(fd.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (rc == 0) {
-        return Result<Uniquefd>::ok(std::move(fd));
-    }
-    if (errno != EINPROGRESS) {
-        return Result<Uniquefd>::err(Error::from_errno("connect upstream"));
-    }
-    auto waited = wait_fd(fd.get(), POLLOUT, static_cast<int>(timeout_ms), "connect upstream");
-    if (waited.is_err()) {
-        return Result<Uniquefd>::err(waited.error());
-    }
-    int so_error = 0;
-    socklen_t len = sizeof(so_error);
-    if (::getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) {
-        return Result<Uniquefd>::err(Error::from_errno("getsockopt(SO_ERROR)"));
-    }
-    if (so_error != 0) {
-        Error e;
-        e.code = ErrCode::SysError;
-        e.sys_errno = so_error;
-        e.msg = "connect upstream";
-        return Result<Uniquefd>::err(std::move(e));
-    }
-    return Result<Uniquefd>::ok(std::move(fd));
-}
 
 Result<void> write_all(int fd, std::span<const unsigned char> bytes, uint32_t timeout_ms) {
     size_t off = 0;
@@ -197,26 +154,35 @@ Result<std::vector<unsigned char>> forward_http1(const HttpRequest& req,
             return Result<std::vector<unsigned char>>::err(appended.error());
         }
     }
+
     auto& up_pool = pools.get(upstream);
-    auto pool_res = up_pool.acquire(loop);
-    if (pool_res.is_err()) {
-        return Result<std::vector<unsigned char>>::err(pool_res.error());
-    }
-    auto conn = std::move(pool_res.value());
     const auto request_bytes = upstream_request.peek(upstream_request.readable());
-    auto wrote = write_all(conn->fd.get(), request_bytes, 5000); // hardcoded timeout for now
-    if (wrote.is_err()) {
-        up_pool.release(nullptr); // drop connection
-        return Result<std::vector<unsigned char>>::err(wrote.error());
-    }
-    auto response = read_response(conn->fd.get(), 5000);
-    if (response.is_err()) {
-        up_pool.release(nullptr); // drop connection
-    } else {
+
+    // Retry once on connection failure (handles stale pooled connections)
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto pool_res = up_pool.acquire(loop);
+        if (pool_res.is_err()) {
+            return Result<std::vector<unsigned char>>::err(pool_res.error());
+        }
+        auto conn = std::move(pool_res.value());
+        auto wrote = write_all(conn->fd.get(), request_bytes, 5000);
+        if (wrote.is_err()) {
+            up_pool.release(nullptr);
+            if (attempt == 0) continue; // retry with fresh connection
+            return Result<std::vector<unsigned char>>::err(wrote.error());
+        }
+        auto response = read_response(conn->fd.get(), 5000);
+        if (response.is_err()) {
+            up_pool.release(nullptr);
+            if (attempt == 0) continue; // retry with fresh connection
+            return response;
+        }
         conn->request_count++;
         up_pool.release(std::move(conn));
+        return response;
     }
-    return response;
+    return Result<std::vector<unsigned char>>::err(
+        Error::from_code(ErrCode::NoUpstream, "upstream request failed after retry"));
 }
 
 } // namespace
@@ -264,6 +230,7 @@ Result<void> ProxyServer::run() {
 }
 
 Result<void> ProxyServer::setup_listeners() {
+    // Plain HTTP listener
     listen_fd_.reset(::socket(AF_INET, SOCK_STREAM, 0));
     if (!listen_fd_.valid()) {
         return Result<void>::err(Error::from_errno("socket listen"));
@@ -288,7 +255,44 @@ Result<void> ProxyServer::setup_listeners() {
     if (::listen(listen_fd_.get(), SOMAXCONN) < 0) {
         return Result<void>::err(Error::from_errno("listen"));
     }
-    return loop_->add(listen_fd_.get(), Event::Read, nullptr);
+    auto added = loop_->add(listen_fd_.get(), Event::Read, nullptr);
+    if (added.is_err()) {
+        return added;
+    }
+
+    // TLS listener (if enabled)
+    if (cfg_.tls.enabled) {
+        tls_listen_fd_.reset(::socket(AF_INET, SOCK_STREAM, 0));
+        if (!tls_listen_fd_.valid()) {
+            return Result<void>::err(Error::from_errno("socket tls listen"));
+        }
+        auto tls_reuse = tls_listen_fd_.set_reuse();
+        if (tls_reuse.is_err()) {
+            return tls_reuse;
+        }
+        auto tls_nb = tls_listen_fd_.set_nonblocking();
+        if (tls_nb.is_err()) {
+            return tls_nb;
+        }
+        sockaddr_in tls_addr{};
+        tls_addr.sin_family = AF_INET;
+        tls_addr.sin_port = htons(cfg_.tls_port);
+        if (::inet_pton(AF_INET, cfg_.listen_addr.c_str(), &tls_addr.sin_addr) != 1) {
+            tls_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        }
+        if (::bind(tls_listen_fd_.get(), reinterpret_cast<sockaddr*>(&tls_addr), sizeof(tls_addr)) < 0) {
+            return Result<void>::err(Error::from_errno("bind tls listen"));
+        }
+        if (::listen(tls_listen_fd_.get(), SOMAXCONN) < 0) {
+            return Result<void>::err(Error::from_errno("listen tls"));
+        }
+        auto tls_added = loop_->add(tls_listen_fd_.get(), Event::Read, nullptr);
+        if (tls_added.is_err()) {
+            return tls_added;
+        }
+    }
+
+    return Result<void>::ok();
 }
 
 void ProxyServer::on_accept(int listen_fd, bool tls) {
@@ -414,6 +418,13 @@ void ProxyServer::on_client_event(int fd, Event events) {
             close_conn(fd, "recv error");
             return;
         }
+
+        if (conn.proto == ClientConn::Proto::HTTP2) {
+            handle_h2_client(conn, fd);
+            return;
+        }
+
+        // HTTP/1.1 path
         HttpRequest req;
         const ParseResult parsed = conn.h1parser.parse_request(conn.rbuf, req);
         if (parsed == ParseResult::Error) {
@@ -427,9 +438,13 @@ void ProxyServer::on_client_event(int fd, Event events) {
             if (req.content_length > buffered_body) {
                 return;
             }
+
             conn.rbuf.commit_read(req.header_bytes);
-            const auto body = conn.rbuf.peek(static_cast<size_t>(req.content_length));
+            auto body_vec = conn.rbuf.peek(static_cast<size_t>(req.content_length));
             conn.rbuf.commit_read(static_cast<size_t>(req.content_length));
+
+            conn.keep_alive = req.keep_alive;
+
             auto upstream = lb_.next();
             if (upstream == nullptr) {
                 static constexpr std::string_view unavailable =
@@ -439,7 +454,7 @@ void ProxyServer::on_client_event(int fd, Event events) {
                 conn.keep_alive = false;
             } else {
                 conn.upstream = upstream;
-                auto response = forward_http1(req, body, upstream, pools_, *loop_);
+                auto response = forward_http1(req, body_vec, upstream, pools_, *loop_);
                 if (response.is_err()) {
                     upstream->failed_requests.fetch_add(1);
                     LOG_WARN("upstream request failed", "upstream", upstream->name, "error",
@@ -448,11 +463,12 @@ void ProxyServer::on_client_event(int fd, Event events) {
                         "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: "
                         "close\r\n\r\n";
                     (void)conn.wbuf.append(bad_gateway);
+                    conn.keep_alive = false;
                 } else {
                     (void)conn.wbuf.append(std::move(response).value());
                 }
-                conn.keep_alive = false;
             }
+            conn.req_count++;
             (void)loop_->modify(fd, Event::Read | Event::Write, &conn);
         }
     }
@@ -475,6 +491,124 @@ void ProxyServer::on_client_event(int fd, Event events) {
         } else {
             (void)loop_->modify(fd, Event::Read, &conn);
         }
+    }
+}
+
+void ProxyServer::handle_h2_client(ClientConn& conn, int fd) {
+    // Initialize H2 connection on first use
+    if (!conn.h2conn) {
+        conn.h2conn = std::make_unique<H2Conn>(true /* is_server */);
+    }
+
+    // Feed buffered data into H2 connection
+    if (conn.rbuf.readable() > 0) {
+        auto data = conn.rbuf.peek(conn.rbuf.readable());
+        auto fed = conn.h2conn->feed(data);
+        if (fed.is_err()) {
+            close_conn(fd, "h2 feed error: " + fed.error().to_string());
+            return;
+        }
+        conn.rbuf.commit_read(data.size());
+    }
+
+    // Process frames and get ready streams
+    auto ready_result = conn.h2conn->process();
+    if (ready_result.is_err()) {
+        close_conn(fd, "h2 process error: " + ready_result.error().to_string());
+        return;
+    }
+
+    // Handle each complete request stream
+    for (uint32_t stream_id : ready_result.value()) {
+        const auto& headers = conn.h2conn->stream_headers(stream_id);
+
+        // Convert H2 pseudo-headers to HTTP/1.1 request
+        HttpRequest req;
+        std::string method, path, authority;
+        for (const auto& h : headers) {
+            if (h.name == ":method") method = h.value;
+            else if (h.name == ":path") path = h.value;
+            else if (h.name == ":authority") authority = h.value;
+            else if (h.name[0] != ':') {
+                req.headers.push_back(HttpHeader{h.name, h.value});
+            }
+        }
+        req.method = method;
+        req.target = path;
+        req.version = "HTTP/1.1";
+        req.keep_alive = true;
+
+        auto body_data = conn.h2conn->stream_body(stream_id);
+        auto body = std::span<const unsigned char>(body_data.data(), body_data.size());
+        req.content_length = body.size();
+
+        // Select upstream and forward
+        auto upstream = lb_.next();
+        if (upstream == nullptr) {
+            std::vector<HpackHeader> resp_headers;
+            resp_headers.push_back({":status", "503"});
+            resp_headers.push_back({"content-length", "0"});
+            (void)conn.h2conn->send_response(stream_id, std::move(resp_headers), {}, true);
+        } else {
+            conn.upstream = upstream;
+            auto response = forward_http1(req, body, upstream, pools_, *loop_);
+            if (response.is_err()) {
+                upstream->failed_requests.fetch_add(1);
+                LOG_WARN("h2 upstream failed", "upstream", upstream->name, "error",
+                         response.error().to_string());
+                std::vector<HpackHeader> resp_headers;
+                resp_headers.push_back({":status", "502"});
+                resp_headers.push_back({"content-length", "0"});
+                (void)conn.h2conn->send_response(stream_id, std::move(resp_headers), {}, true);
+            } else {
+                // Parse upstream HTTP/1.1 response and convert to H2
+                auto& resp_bytes = response.value();
+                RingBuffer resp_buf(resp_bytes.size());
+                (void)resp_buf.append(resp_bytes);
+                HttpResponse resp;
+                Http1Parser parser;
+                if (parser.parse_response(resp_buf, resp) == ParseResult::Complete) {
+                    std::vector<HpackHeader> resp_headers;
+                    resp_headers.push_back({":status", std::to_string(resp.status)});
+                    for (const auto& h : resp.headers) {
+                        // Skip hop-by-hop headers
+                        std::string lname(h.name);
+                        for (auto& c : lname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        if (lname == "connection" || lname == "keep-alive" ||
+                            lname == "transfer-encoding" || lname == "upgrade") {
+                            continue;
+                        }
+                        resp_headers.push_back({std::string(h.name), std::string(h.value)});
+                    }
+                    size_t body_offset = resp.header_bytes;
+                    size_t body_len = resp_bytes.size() > body_offset
+                                          ? resp_bytes.size() - body_offset
+                                          : 0;
+                    auto resp_body = std::span<const unsigned char>(
+                        resp_bytes.data() + body_offset, body_len);
+                    (void)conn.h2conn->send_response(stream_id, std::move(resp_headers),
+                                                     resp_body, true);
+                } else {
+                    std::vector<HpackHeader> resp_headers;
+                    resp_headers.push_back({":status", "502"});
+                    resp_headers.push_back({"content-length", "0"});
+                    (void)conn.h2conn->send_response(stream_id, std::move(resp_headers), {}, true);
+                }
+            }
+        }
+        conn.h2conn->consume_body(stream_id, body.size());
+    }
+
+    // Flush H2 output to client
+    auto output = conn.h2conn->pending_output();
+    if (!output.empty()) {
+        (void)conn.wbuf.append(output);
+        conn.h2conn->consume_output(output.size());
+        (void)loop_->modify(fd, Event::Read | Event::Write, &conn);
+    }
+
+    if (conn.h2conn->is_done()) {
+        close_conn(fd, "h2 done");
     }
 }
 

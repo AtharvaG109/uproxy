@@ -80,11 +80,11 @@ Result<TLSContext> TLSContext::server(const TLSConfig& cfg) {
         return Result<TLSContext>::err(Error::from_code(ErrCode::SysError, "SSL_CTX_new failed"));
     }
 
-    if (SSL_CTX_use_certificate_chain_file(impl->ssl_ctx, cfg.cert_path.c_str()) != 1) {
-        return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Failed to load cert_path"));
+    if (SSL_CTX_use_certificate_chain_file(impl->ssl_ctx, cfg.cert_file.c_str()) != 1) {
+        return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Failed to load cert_file"));
     }
-    if (SSL_CTX_use_PrivateKey_file(impl->ssl_ctx, cfg.key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
-        return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Failed to load key_path"));
+    if (SSL_CTX_use_PrivateKey_file(impl->ssl_ctx, cfg.key_file.c_str(), SSL_FILETYPE_PEM) != 1) {
+        return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Failed to load key_file"));
     }
     if (SSL_CTX_check_private_key(impl->ssl_ctx) != 1) {
         return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Private key does not match certificate"));

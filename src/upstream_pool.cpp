@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstring>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <thread>
 
@@ -124,6 +125,21 @@ Result<std::unique_ptr<PooledConn>> UpstreamPool::new_connection(EventLoop& loop
     const int rc = ::connect(fd.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     if (rc < 0 && errno != EINPROGRESS) {
         return Result<std::unique_ptr<PooledConn>>::err(Error::from_errno("connect upstream"));
+    }
+    if (rc < 0) {
+        // Wait for connect to complete
+        pollfd pfd{fd.get(), POLLOUT, 0};
+        int poll_rc = ::poll(&pfd, 1, static_cast<int>(cfg_.connect_timeout_ms));
+        if (poll_rc <= 0) {
+            return Result<std::unique_ptr<PooledConn>>::err(
+                Error::from_code(ErrCode::Timeout, "connect upstream timeout"));
+        }
+        int so_error = 0;
+        socklen_t elen = sizeof(so_error);
+        if (::getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &so_error, &elen) < 0 || so_error != 0) {
+            return Result<std::unique_ptr<PooledConn>>::err(
+                Error::from_code(ErrCode::SysError, "connect upstream failed"));
+        }
     }
     auto conn = std::make_unique<PooledConn>();
     conn->fd = std::move(fd);

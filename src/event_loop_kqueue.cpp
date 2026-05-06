@@ -48,7 +48,7 @@ class KqueueLoop final : public EventLoop {
         timespec* timeout_ptr = nullptr;
         if (timeout_ms >= 0) {
             timeout.tv_sec = timeout_ms / 1000;
-            timeout.tv_nsec = (timeout_ms % 1000) * 1000000;
+            timeout.tv_nsec = (timeout_ms % 1000) * 1000000L;
             timeout_ptr = &timeout;
         }
         const int n = ::kevent(kqfd_.get(), nullptr, 0, events, MAX_EVENTS, timeout_ptr);
@@ -109,25 +109,42 @@ class KqueueLoop final : public EventLoop {
         return Result<void>::ok();
     }
 
+    // Track which filters are registered per fd
+    std::unordered_map<int, uint32_t> registered_;
+
   private:
     Result<void> apply(int fd, Event events, void* user_data, uint16_t flags) {
-        struct kevent changes[2];
-        int n = 0;
+        uint32_t cur = registered_[fd];
+
         if (has(events, Event::Read)) {
-            EV_SET(&changes[n++], static_cast<uintptr_t>(fd), EVFILT_READ, flags, 0, 0, user_data);
-        } else {
-            EV_SET(&changes[n++], static_cast<uintptr_t>(fd), EVFILT_READ, EV_DELETE, 0, 0,
-                   nullptr);
+            struct kevent ev;
+            EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_READ, flags, 0, 0, user_data);
+            if (::kevent(kqfd_.get(), &ev, 1, nullptr, 0, nullptr) < 0) {
+                return Result<void>::err(Error::from_errno("kevent add read"));
+            }
+            cur |= 1;
+        } else if (cur & 1) {
+            struct kevent ev;
+            EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+            (void)::kevent(kqfd_.get(), &ev, 1, nullptr, 0, nullptr);
+            cur &= ~1u;
         }
+
         if (has(events, Event::Write)) {
-            EV_SET(&changes[n++], static_cast<uintptr_t>(fd), EVFILT_WRITE, flags, 0, 0, user_data);
-        } else {
-            EV_SET(&changes[n++], static_cast<uintptr_t>(fd), EVFILT_WRITE, EV_DELETE, 0, 0,
-                   nullptr);
+            struct kevent ev;
+            EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_WRITE, flags, 0, 0, user_data);
+            if (::kevent(kqfd_.get(), &ev, 1, nullptr, 0, nullptr) < 0) {
+                return Result<void>::err(Error::from_errno("kevent add write"));
+            }
+            cur |= 2;
+        } else if (cur & 2) {
+            struct kevent ev;
+            EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+            (void)::kevent(kqfd_.get(), &ev, 1, nullptr, 0, nullptr);
+            cur &= ~2u;
         }
-        if (::kevent(kqfd_.get(), changes, n, nullptr, 0, nullptr) < 0 && errno != ENOENT) {
-            return Result<void>::err(Error::from_errno("kevent apply"));
-        }
+
+        registered_[fd] = cur;
         return Result<void>::ok();
     }
 };
