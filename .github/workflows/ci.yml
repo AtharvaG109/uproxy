@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake clang-14
+      - run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug && ninja -C build
+      - run: ctest --test-dir build --output-on-failure
+      - run: cmake -B build-asan -G Ninja -DENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug && ninja -C build-asan
+      - run: ctest --test-dir build-asan --output-on-failure
+      - run: cmake -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build-rel
+
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: brew install ninja cmake
+      - run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug && ninja -C build
+      - run: ctest --test-dir build --output-on-failure
+
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-format-14 clang-tidy-14 cmake ninja-build
+      - run: find src include -name '*.cpp' -o -name '*.h' | xargs clang-format-14 --dry-run --Werror
+      - run: cmake -B build -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - run: clang-tidy-14 --quiet src/*.cpp -- -Iinclude -std=c++20
+

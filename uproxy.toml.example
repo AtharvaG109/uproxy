@@ -1,0 +1,30 @@
+[proxy]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+tls_port = 8443
+worker_threads = 4
+
+[tls]
+cert_file = "/etc/uproxy/cert.pem"
+key_file = "/etc/uproxy/key.pem"
+min_version = "tls1.2"
+alpn = ["h2", "http/1.1"]
+
+[pool]
+max_connections_per_upstream = 64
+connect_timeout_ms = 5000
+idle_timeout_ms = 60000
+max_keepalive = 1000
+
+[log]
+level = "info"
+format = "text"
+file = ""
+
+[[upstream]]
+name = "backend-1"
+addr = "127.0.0.1"
+port = 3000
+weight = 10
+healthy = true
+
