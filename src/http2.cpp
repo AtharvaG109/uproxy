@@ -309,6 +309,9 @@ Result<void> H2Conn::handle_frame(const H2Frame& frame, std::vector<uint32_t>& r
     last_peer_stream_ = std::max(last_peer_stream_, frame.stream_id);
     auto& stream = get_or_create_stream(frame.stream_id);
     if (frame.type == H2FrameType::HEADERS) {
+        if (stream.state != H2StreamState::Idle && stream.state != H2StreamState::Open && stream.state != H2StreamState::HalfClosedLocal) {
+            return writer_.write_rst_stream(send_buf_, frame.stream_id, H2Error::STREAM_CLOSED);
+        }
         if ((frame.flags & H2Flags::END_HEADERS) == 0U) {
             return Result<void>::err(Error::from_code(ErrCode::Http2Protocol,
                                                       "CONTINUATION unsupported in simple block"));
@@ -317,15 +320,27 @@ Result<void> H2Conn::handle_frame(const H2Frame& frame, std::vector<uint32_t>& r
         if (decoded.is_err()) {
             return decoded;
         }
-        stream.state = (frame.flags & H2Flags::END_STREAM) != 0U ? H2StreamState::HalfClosedRemote
-                                                                 : H2StreamState::Open;
+        if (stream.state == H2StreamState::Idle) {
+            stream.state = (frame.flags & H2Flags::END_STREAM) != 0U ? H2StreamState::HalfClosedRemote
+                                                                     : H2StreamState::Open;
+        } else if (stream.state == H2StreamState::Open && (frame.flags & H2Flags::END_STREAM) != 0U) {
+            stream.state = H2StreamState::HalfClosedRemote;
+        } else if (stream.state == H2StreamState::HalfClosedLocal && (frame.flags & H2Flags::END_STREAM) != 0U) {
+            stream.state = H2StreamState::Closed;
+        }
         if ((frame.flags & H2Flags::END_STREAM) != 0U) {
             ready.push_back(frame.stream_id);
         }
         return Result<void>::ok();
     }
     if (frame.type == H2FrameType::DATA) {
-        if (stream.state != H2StreamState::Open) {
+        if (stream.state == H2StreamState::Idle) {
+            return Result<void>::err(Error::from_code(ErrCode::Http2Protocol, "DATA on idle stream"));
+        }
+        if (stream.state == H2StreamState::HalfClosedRemote || stream.state == H2StreamState::Closed) {
+            return writer_.write_rst_stream(send_buf_, frame.stream_id, H2Error::STREAM_CLOSED);
+        }
+        if (stream.state != H2StreamState::Open && stream.state != H2StreamState::HalfClosedLocal) {
             return Result<void>::err(
                 Error::from_code(ErrCode::Http2Protocol, "DATA on closed stream"));
         }
@@ -334,7 +349,11 @@ Result<void> H2Conn::handle_frame(const H2Frame& frame, std::vector<uint32_t>& r
             return r;
         }
         if ((frame.flags & H2Flags::END_STREAM) != 0U) {
-            stream.state = H2StreamState::HalfClosedRemote;
+            if (stream.state == H2StreamState::Open) {
+                stream.state = H2StreamState::HalfClosedRemote;
+            } else if (stream.state == H2StreamState::HalfClosedLocal) {
+                stream.state = H2StreamState::Closed;
+            }
             ready.push_back(frame.stream_id);
         }
         return Result<void>::ok();

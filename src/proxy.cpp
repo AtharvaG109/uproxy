@@ -182,11 +182,12 @@ std::string upstream_host(const UpstreamEndpoint& upstream) {
 
 Result<std::vector<unsigned char>> forward_http1(const HttpRequest& req,
                                                  std::span<const unsigned char> body,
-                                                 const UpstreamEndpoint& upstream,
-                                                 const PoolConfig& pool) {
+                                                 std::shared_ptr<UpstreamEndpoint> upstream,
+                                                 PoolManager& pools,
+                                                 EventLoop& loop) {
     RingBuffer upstream_request(65536 + body.size());
     Http1Serializer serializer;
-    auto serialized = serializer.write_request(upstream_request, req, upstream_host(upstream));
+    auto serialized = serializer.write_request(upstream_request, req, upstream_host(*upstream));
     if (serialized.is_err()) {
         return Result<std::vector<unsigned char>>::err(serialized.error());
     }
@@ -196,17 +197,26 @@ Result<std::vector<unsigned char>> forward_http1(const HttpRequest& req,
             return Result<std::vector<unsigned char>>::err(appended.error());
         }
     }
-    auto connected = connect_upstream(upstream, pool.connect_timeout_ms);
-    if (connected.is_err()) {
-        return Result<std::vector<unsigned char>>::err(connected.error());
+    auto& up_pool = pools.get(upstream);
+    auto pool_res = up_pool.acquire(loop);
+    if (pool_res.is_err()) {
+        return Result<std::vector<unsigned char>>::err(pool_res.error());
     }
-    Uniquefd upstream_fd = std::move(connected).value();
+    auto conn = std::move(pool_res.value());
     const auto request_bytes = upstream_request.peek(upstream_request.readable());
-    auto wrote = write_all(upstream_fd.get(), request_bytes, pool.connect_timeout_ms);
+    auto wrote = write_all(conn->fd.get(), request_bytes, 5000); // hardcoded timeout for now
     if (wrote.is_err()) {
+        up_pool.release(nullptr); // drop connection
         return Result<std::vector<unsigned char>>::err(wrote.error());
     }
-    return read_response(upstream_fd.get(), pool.connect_timeout_ms);
+    auto response = read_response(conn->fd.get(), 5000);
+    if (response.is_err()) {
+        up_pool.release(nullptr); // drop connection
+    } else {
+        conn->request_count++;
+        up_pool.release(std::move(conn));
+    }
+    return response;
 }
 
 } // namespace
@@ -296,7 +306,12 @@ void ProxyServer::on_accept(int listen_fd, bool tls) {
         (void)fd.set_nonblocking();
         auto conn = std::make_unique<ClientConn>();
         conn->fd = std::move(fd);
-        conn->state = tls ? ConnState::TLSHandshake : ConnState::ReadRequest;
+        if (tls) {
+            conn->state = ConnState::TLSHandshake;
+            conn->tls_conn = std::make_unique<TLSConn>(tls_ctx_.get(), true);
+        } else {
+            conn->state = ConnState::ReadRequest;
+        }
         conn->connected_at_ms = now_ms();
         char remote[INET_ADDRSTRLEN] = {};
         if (::inet_ntop(AF_INET, &addr.sin_addr, remote, sizeof(remote)) != nullptr) {
@@ -322,6 +337,60 @@ void ProxyServer::on_client_event(int fd, Event events) {
         return;
     }
     auto& conn = *it->second;
+    
+    if (conn.state == ConnState::TLSHandshake) {
+        if (has(events, Event::Read)) {
+            unsigned char tmp[8192];
+            for (;;) {
+                const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+                if (n > 0) {
+                    (void)conn.tls_conn->feed_encrypted(std::span<const unsigned char>(tmp, static_cast<size_t>(n)));
+                } else if (n == 0) {
+                    close_conn(fd, "eof in handshake");
+                    return;
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                } else {
+                    close_conn(fd, "recv error in handshake");
+                    return;
+                }
+            }
+        }
+        auto state_res = conn.tls_conn->do_handshake();
+        unsigned char out_tmp[8192];
+        for (;;) {
+            auto out_res = conn.tls_conn->take_encrypted(out_tmp);
+            if (out_res.is_err() || out_res.value() == 0) break;
+            size_t off = 0;
+            while (off < out_res.value()) {
+                ssize_t sent = ::send(fd, out_tmp + off, out_res.value() - off, 0);
+                if (sent > 0) {
+                    off += static_cast<size_t>(sent);
+                } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    // For simplicity, we assume we can write everything in the handshake.
+                    break;
+                } else {
+                    close_conn(fd, "send error in handshake");
+                    return;
+                }
+            }
+        }
+        if (state_res.is_err()) {
+            close_conn(fd, "tls handshake error: " + state_res.error().to_string());
+            return;
+        }
+        if (state_res.value() == TLSHandshakeState::Done) {
+            conn.state = ConnState::ReadRequest;
+            if (conn.tls_conn->alpn_protocol() == "h2") {
+                conn.proto = ClientConn::Proto::HTTP2;
+            } else {
+                conn.proto = ClientConn::Proto::HTTP1;
+            }
+            (void)loop_->modify(fd, Event::Read | Event::Write, &conn);
+        }
+        return; // Handshake takes precedence
+    }
+    
     if (has(events, Event::Read)) {
         unsigned char tmp[8192];
         for (;;) {
@@ -370,7 +439,7 @@ void ProxyServer::on_client_event(int fd, Event events) {
                 conn.keep_alive = false;
             } else {
                 conn.upstream = upstream;
-                auto response = forward_http1(req, body, *upstream, cfg_.pool);
+                auto response = forward_http1(req, body, upstream, pools_, *loop_);
                 if (response.is_err()) {
                     upstream->failed_requests.fetch_add(1);
                     LOG_WARN("upstream request failed", "upstream", upstream->name, "error",
