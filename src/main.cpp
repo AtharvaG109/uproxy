@@ -4,6 +4,8 @@
 
 #include <csignal>
 #include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 
 int main(int argc, char** argv) {
     using namespace uproxy;
@@ -20,9 +22,15 @@ int main(int argc, char** argv) {
 
     FILE* log_out = stderr;
     if (!cfg.log.file.empty()) {
-        log_out = std::fopen(cfg.log.file.c_str(), "a");
-        if (log_out == nullptr) {
+        int log_fd = ::open(cfg.log.file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (log_fd < 0) {
             std::fprintf(stderr, "Log error: cannot open %s\n", cfg.log.file.c_str());
+            return 1;
+        }
+        log_out = ::fdopen(log_fd, "a");
+        if (log_out == nullptr) {
+            ::close(log_fd);
+            std::fprintf(stderr, "Log error: fdopen failed for %s\n", cfg.log.file.c_str());
             return 1;
         }
     }
@@ -30,6 +38,9 @@ int main(int argc, char** argv) {
     g_log = &logger;
 
     std::signal(SIGPIPE, SIG_IGN);
+    // g_shutdown is intentionally public static: signal handlers need direct
+    // access without an instance pointer, and the atomic provides the necessary
+    // thread-safety guarantees for this cross-thread/signal communication.
     std::signal(SIGINT, [](int) { ProxyServer::g_shutdown.store(true); });
     std::signal(SIGTERM, [](int) { ProxyServer::g_shutdown.store(true); });
 

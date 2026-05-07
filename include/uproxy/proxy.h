@@ -30,6 +30,8 @@ struct ClientConn {
     Uniquefd fd;
     ConnState state{ConnState::ReadRequest};
     enum class Proto { HTTP1, HTTP2 } proto{Proto::HTTP1};
+    // 65536 (64 KiB): matches HTTP/2 default max frame size and provides a
+    // reasonable read/write buffer for a single client without excessive memory.
     RingBuffer rbuf{65536};
     RingBuffer wbuf{65536};
     Http1Parser h1parser;
@@ -39,6 +41,7 @@ struct ClientConn {
     std::unique_ptr<H2Conn> h2conn;
     std::shared_ptr<UpstreamEndpoint> upstream;
     PooledConn* upstream_conn{nullptr};
+    // 65536 (64 KiB): same rationale as client rbuf/wbuf above.
     RingBuffer up_rbuf{65536};
     RingBuffer up_wbuf{65536};
     uint64_t connected_at_ms{0};
@@ -60,6 +63,9 @@ class ProxyServer {
   public:
     explicit ProxyServer(ProxyConfig cfg);
     [[nodiscard]] Result<void> run();
+    // Intentionally public static: accessed directly from signal handlers which
+    // lack an instance pointer. Atomic store is async-signal-safe on all
+    // supported platforms.
     static std::atomic<bool> g_shutdown;
 
   private:

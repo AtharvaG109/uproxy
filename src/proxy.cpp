@@ -247,7 +247,9 @@ Result<void> ProxyServer::setup_listeners() {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(cfg_.listen_port);
     if (::inet_pton(AF_INET, cfg_.listen_addr.c_str(), &addr.sin_addr) != 1) {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        LOG_ERROR("invalid listen_addr, inet_pton failed", "addr", cfg_.listen_addr);
+        return Result<void>::err(
+            Error::from_code(ErrCode::SysError, "invalid listen address: " + cfg_.listen_addr));
     }
     if (::bind(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         return Result<void>::err(Error::from_errno("bind listen"));
@@ -278,7 +280,9 @@ Result<void> ProxyServer::setup_listeners() {
         tls_addr.sin_family = AF_INET;
         tls_addr.sin_port = htons(cfg_.tls_port);
         if (::inet_pton(AF_INET, cfg_.listen_addr.c_str(), &tls_addr.sin_addr) != 1) {
-            tls_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            LOG_ERROR("invalid listen_addr for TLS, inet_pton failed", "addr", cfg_.listen_addr);
+            return Result<void>::err(
+                Error::from_code(ErrCode::SysError, "invalid TLS listen address: " + cfg_.listen_addr));
         }
         if (::bind(tls_listen_fd_.get(), reinterpret_cast<sockaddr*>(&tls_addr), sizeof(tls_addr)) < 0) {
             return Result<void>::err(Error::from_errno("bind tls listen"));

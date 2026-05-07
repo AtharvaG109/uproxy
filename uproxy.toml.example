@@ -1,30 +1,60 @@
 [proxy]
+# IPv4 address to bind the listening socket to (e.g. "0.0.0.0" for all
+# interfaces, "127.0.0.1" for localhost only). Must be a valid IPv4 address.
 listen_addr = "0.0.0.0"
+# Port for plain HTTP connections. Valid range: 1-65535.
 listen_port = 8080
+# Port for TLS-terminated connections. Valid range: 1-65535. Only used when
+# TLS is enabled via the [tls] section.
 tls_port = 8443
+# Number of worker threads for the event loop. Typically set to the number
+# of available CPU cores. Valid range: 1-256.
 worker_threads = 4
 
 [tls]
+# Path to the PEM-encoded TLS certificate file.
 cert_file = "/etc/uproxy/cert.pem"
+# Path to the PEM-encoded TLS private key file. Must be readable only by the
+# uproxy service account (recommended permissions: 0600).
 key_file = "/etc/uproxy/key.pem"
+# Minimum TLS version to accept. Valid values: "tls1.2", "tls1.3".
 min_version = "tls1.2"
+# ALPN protocols to advertise during the TLS handshake, in preference order.
 alpn = ["h2", "http/1.1"]
 
 [pool]
+# Maximum number of persistent connections to keep per upstream backend.
+# Valid range: 1-4096.
 max_connections_per_upstream = 64
+# Timeout in milliseconds for establishing a new upstream connection.
+# Valid range: 100-300000.
 connect_timeout_ms = 5000
+# Time in milliseconds before an idle pooled connection is closed.
+# Valid range: 1000-3600000.
 idle_timeout_ms = 60000
+# Maximum number of requests to send on a single pooled connection before
+# closing it and opening a fresh one. Valid range: 1-1000000.
 max_keepalive = 1000
 
 [log]
+# Minimum log level. Valid values: "trace", "debug", "info", "warn", "error".
 level = "info"
+# Output format. Valid values: "text" (human-readable), "json" (structured).
 format = "text"
+# Path to a log file. If empty, logs are written to stderr. The file is
+# created with mode 0600 if it does not exist.
 file = ""
 
 [[upstream]]
+# Human-readable name for this upstream (used in log messages).
 name = "backend-1"
+# IPv4 address of the upstream backend.
 addr = "127.0.0.1"
+# Port of the upstream backend. Valid range: 1-65535.
 port = 3000
+# Relative weight for weighted round-robin load balancing. Higher values
+# send proportionally more traffic to this backend. Valid range: 1-1000.
 weight = 10
+# Whether this upstream is considered healthy and eligible to receive
+# traffic. Set to false to drain a backend.
 healthy = true
-
