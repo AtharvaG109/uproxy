@@ -162,15 +162,25 @@ Result<void> H2FrameWriter::write_headers(RingBuffer& buf, uint32_t stream_id,
 Result<void> H2FrameWriter::write_data(RingBuffer& buf, uint32_t stream_id,
                                        std::span<const unsigned char> data, bool end_stream,
                                        uint32_t max_frame_size) {
-    if (stream_id == 0 || data.size() > max_frame_size) {
+    if (stream_id == 0 || max_frame_size == 0) {
         return Result<void>::err(Error::from_code(ErrCode::Http2Protocol, "invalid DATA frame"));
     }
-    auto r = write_frame_header(buf, static_cast<uint32_t>(data.size()), H2FrameType::DATA,
-                                end_stream ? H2Flags::END_STREAM : 0, stream_id);
-    if (r.is_err()) {
-        return r;
+    size_t offset = 0;
+    while (offset < data.size()) {
+        const size_t chunk = std::min<size_t>(max_frame_size, data.size() - offset);
+        const bool final_chunk = end_stream && offset + chunk == data.size();
+        auto r = write_frame_header(buf, static_cast<uint32_t>(chunk), H2FrameType::DATA,
+                                    final_chunk ? H2Flags::END_STREAM : 0, stream_id);
+        if (r.is_err()) {
+            return r;
+        }
+        r = buf.append(data.subspan(offset, chunk));
+        if (r.is_err()) {
+            return r;
+        }
+        offset += chunk;
     }
-    return buf.append(data);
+    return Result<void>::ok();
 }
 
 H2Conn::H2Conn(bool is_server) : is_server_(is_server) {
@@ -309,7 +319,8 @@ Result<void> H2Conn::handle_frame(const H2Frame& frame, std::vector<uint32_t>& r
     last_peer_stream_ = std::max(last_peer_stream_, frame.stream_id);
     auto& stream = get_or_create_stream(frame.stream_id);
     if (frame.type == H2FrameType::HEADERS) {
-        if (stream.state != H2StreamState::Idle && stream.state != H2StreamState::Open && stream.state != H2StreamState::HalfClosedLocal) {
+        if (stream.state != H2StreamState::Idle && stream.state != H2StreamState::Open &&
+            stream.state != H2StreamState::HalfClosedLocal) {
             return writer_.write_rst_stream(send_buf_, frame.stream_id, H2Error::STREAM_CLOSED);
         }
         if ((frame.flags & H2Flags::END_HEADERS) == 0U) {
@@ -321,11 +332,14 @@ Result<void> H2Conn::handle_frame(const H2Frame& frame, std::vector<uint32_t>& r
             return decoded;
         }
         if (stream.state == H2StreamState::Idle) {
-            stream.state = (frame.flags & H2Flags::END_STREAM) != 0U ? H2StreamState::HalfClosedRemote
-                                                                     : H2StreamState::Open;
-        } else if (stream.state == H2StreamState::Open && (frame.flags & H2Flags::END_STREAM) != 0U) {
+            stream.state = (frame.flags & H2Flags::END_STREAM) != 0U
+                               ? H2StreamState::HalfClosedRemote
+                               : H2StreamState::Open;
+        } else if (stream.state == H2StreamState::Open &&
+                   (frame.flags & H2Flags::END_STREAM) != 0U) {
             stream.state = H2StreamState::HalfClosedRemote;
-        } else if (stream.state == H2StreamState::HalfClosedLocal && (frame.flags & H2Flags::END_STREAM) != 0U) {
+        } else if (stream.state == H2StreamState::HalfClosedLocal &&
+                   (frame.flags & H2Flags::END_STREAM) != 0U) {
             stream.state = H2StreamState::Closed;
         }
         if ((frame.flags & H2Flags::END_STREAM) != 0U) {
@@ -335,9 +349,11 @@ Result<void> H2Conn::handle_frame(const H2Frame& frame, std::vector<uint32_t>& r
     }
     if (frame.type == H2FrameType::DATA) {
         if (stream.state == H2StreamState::Idle) {
-            return Result<void>::err(Error::from_code(ErrCode::Http2Protocol, "DATA on idle stream"));
+            return Result<void>::err(
+                Error::from_code(ErrCode::Http2Protocol, "DATA on idle stream"));
         }
-        if (stream.state == H2StreamState::HalfClosedRemote || stream.state == H2StreamState::Closed) {
+        if (stream.state == H2StreamState::HalfClosedRemote ||
+            stream.state == H2StreamState::Closed) {
             return writer_.write_rst_stream(send_buf_, frame.stream_id, H2Error::STREAM_CLOSED);
         }
         if (stream.state != H2StreamState::Open && stream.state != H2StreamState::HalfClosedLocal) {

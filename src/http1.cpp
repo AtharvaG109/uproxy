@@ -241,6 +241,7 @@ Result<void> Http1Serializer::write_request(RingBuffer& buf, const HttpRequest& 
     std::ostringstream os;
     os << req.method << ' ' << req.target << ' ' << req.version << "\r\n";
     os << "Host: " << host << "\r\n";
+    bool saw_content_length = false;
     for (const auto& h : req.headers) {
         const std::string name = lower(h.name);
         if (name == "host" || name == "connection" || name == "keep-alive" ||
@@ -248,11 +249,17 @@ Result<void> Http1Serializer::write_request(RingBuffer& buf, const HttpRequest& 
             name == "trailers" || name == "transfer-encoding" || name == "upgrade") {
             continue;
         }
+        if (name == "content-length") {
+            saw_content_length = true;
+        }
         if (!valid_header_value(h.value)) {
             return Result<void>::err(
                 Error::from_code(ErrCode::HttpMalformed, "invalid header value"));
         }
         os << h.name << ": " << h.value << "\r\n";
+    }
+    if (req.content_length > 0 && !saw_content_length) {
+        os << "Content-Length: " << req.content_length << "\r\n";
     }
     os << "Via: 1.1 uproxy\r\n\r\n";
     return buf.append(os.str());

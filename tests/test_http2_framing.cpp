@@ -14,5 +14,17 @@ int main_http2_tests() {
     check(frame.type == H2FrameType::PING);
     check(frame.length == 8);
     check(frame.stream_id == 0);
+
+    RingBuffer data_buf(1024);
+    const unsigned char payload[5] = {'h', 'e', 'l', 'l', 'o'};
+    check(writer.write_data(data_buf, 1, payload, true, 3).is_ok());
+    check(reader.read_frame(data_buf, frame, 16384) == ParseResult::Complete);
+    check(frame.type == H2FrameType::DATA);
+    check(frame.length == 3);
+    check((frame.flags & H2Flags::END_STREAM) == 0);
+    check(reader.read_frame(data_buf, frame, 16384) == ParseResult::Complete);
+    check(frame.type == H2FrameType::DATA);
+    check(frame.length == 2);
+    check((frame.flags & H2Flags::END_STREAM) != 0);
     return 0;
 }

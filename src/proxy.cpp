@@ -50,7 +50,6 @@ Result<void> wait_fd(int fd, short event, int timeout_ms, std::string_view op) {
     }
 }
 
-
 Result<void> write_all(int fd, std::span<const unsigned char> bytes, uint32_t timeout_ms) {
     size_t off = 0;
     while (off < bytes.size()) {
@@ -70,6 +69,171 @@ Result<void> write_all(int fd, std::span<const unsigned char> bytes, uint32_t ti
             continue;
         }
         return Result<void>::err(Error::from_errno("write upstream"));
+    }
+    return Result<void>::ok();
+}
+
+bool is_would_block(const Error& error) {
+    return error.code == ErrCode::WouldBlock;
+}
+
+Result<void> flush_tls_ciphertext(ClientConn& conn, int fd) {
+    if (!conn.tls_conn) {
+        return Result<void>::ok();
+    }
+    while (conn.tls_pending.readable() > 0) {
+        const auto bytes = conn.tls_pending.peek(conn.tls_pending.readable());
+        const ssize_t sent = ::send(fd, bytes.data(), bytes.size(), 0);
+        if (sent > 0) {
+            conn.tls_pending.commit_read(static_cast<size_t>(sent));
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return Result<void>::err(Error::from_code(ErrCode::WouldBlock, "tls write"));
+        }
+        return Result<void>::err(Error::from_errno("tls write"));
+    }
+    unsigned char out[8192];
+    for (;;) {
+        auto encrypted = conn.tls_conn->take_encrypted(out);
+        if (encrypted.is_err()) {
+            return Result<void>::err(encrypted.error());
+        }
+        if (encrypted.value() == 0) {
+            return Result<void>::ok();
+        }
+        size_t off = 0;
+        while (off < encrypted.value()) {
+            const ssize_t sent = ::send(fd, out + off, encrypted.value() - off, 0);
+            if (sent > 0) {
+                off += static_cast<size_t>(sent);
+                continue;
+            }
+            if (sent < 0 && errno == EINTR) {
+                continue;
+            }
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                auto saved = conn.tls_pending.append(
+                    std::span<const unsigned char>(out + off, encrypted.value() - off));
+                if (saved.is_err()) {
+                    return saved;
+                }
+                return Result<void>::err(Error::from_code(ErrCode::WouldBlock, "tls write"));
+            }
+            return Result<void>::err(Error::from_errno("tls write"));
+        }
+    }
+}
+
+Result<void> append_client_plaintext(ClientConn& conn, std::span<const unsigned char> data) {
+    auto appended = conn.rbuf.append(data);
+    if (appended.is_err()) {
+        return appended;
+    }
+    return Result<void>::ok();
+}
+
+Result<bool> read_client_input(ClientConn& conn, int fd) {
+    bool saw_eof = false;
+    unsigned char tmp[8192];
+    for (;;) {
+        const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (n > 0) {
+            if (conn.tls_conn) {
+                auto fed = conn.tls_conn->feed_encrypted(
+                    std::span<const unsigned char>(tmp, static_cast<size_t>(n)));
+                if (fed.is_err()) {
+                    return Result<bool>::err(fed.error());
+                }
+            } else {
+                auto appended = append_client_plaintext(
+                    conn, std::span<const unsigned char>(tmp, static_cast<size_t>(n)));
+                if (appended.is_err()) {
+                    return Result<bool>::err(appended.error());
+                }
+            }
+            continue;
+        }
+        if (n == 0) {
+            saw_eof = true;
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+        return Result<bool>::err(Error::from_errno("read client"));
+    }
+    if (conn.tls_conn) {
+        for (;;) {
+            auto decrypted = conn.tls_conn->read(tmp);
+            if (decrypted.is_ok()) {
+                auto appended = append_client_plaintext(
+                    conn, std::span<const unsigned char>(tmp, decrypted.value()));
+                if (appended.is_err()) {
+                    return Result<bool>::err(appended.error());
+                }
+                continue;
+            }
+            if (is_would_block(decrypted.error())) {
+                break;
+            }
+            return Result<bool>::err(decrypted.error());
+        }
+        auto flushed = flush_tls_ciphertext(conn, fd);
+        if (flushed.is_err() && !is_would_block(flushed.error())) {
+            return Result<bool>::err(flushed.error());
+        }
+    }
+    return Result<bool>::ok(saw_eof);
+}
+
+Result<void> write_client_output(ClientConn& conn, int fd) {
+    while (conn.wbuf.readable() > 0) {
+        const auto bytes = conn.wbuf.peek(conn.wbuf.readable());
+        if (conn.tls_conn) {
+            auto written = conn.tls_conn->write(bytes);
+            if (written.is_err()) {
+                if (is_would_block(written.error())) {
+                    auto flushed = flush_tls_ciphertext(conn, fd);
+                    if (flushed.is_err() && !is_would_block(flushed.error())) {
+                        return flushed;
+                    }
+                    return Result<void>::err(
+                        Error::from_code(ErrCode::WouldBlock, "tls write pending"));
+                }
+                return Result<void>::err(written.error());
+            }
+            conn.wbuf.commit_read(written.value());
+            auto flushed = flush_tls_ciphertext(conn, fd);
+            if (flushed.is_err()) {
+                return flushed;
+            }
+            continue;
+        }
+        const ssize_t n = ::send(fd, bytes.data(), bytes.size(), 0);
+        if (n > 0) {
+            conn.wbuf.commit_read(static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return Result<void>::err(Error::from_code(ErrCode::WouldBlock, "write client"));
+        }
+        return Result<void>::err(Error::from_errno("write client"));
+    }
+    if (conn.tls_conn) {
+        auto flushed = flush_tls_ciphertext(conn, fd);
+        if (flushed.is_err()) {
+            return flushed;
+        }
     }
     return Result<void>::ok();
 }
@@ -140,8 +304,7 @@ std::string upstream_host(const UpstreamEndpoint& upstream) {
 Result<std::vector<unsigned char>> forward_http1(const HttpRequest& req,
                                                  std::span<const unsigned char> body,
                                                  std::shared_ptr<UpstreamEndpoint> upstream,
-                                                 PoolManager& pools,
-                                                 EventLoop& loop) {
+                                                 PoolManager& pools, EventLoop& loop) {
     RingBuffer upstream_request(65536 + body.size());
     Http1Serializer serializer;
     auto serialized = serializer.write_request(upstream_request, req, upstream_host(*upstream));
@@ -168,13 +331,17 @@ Result<std::vector<unsigned char>> forward_http1(const HttpRequest& req,
         auto wrote = write_all(conn->fd.get(), request_bytes, 5000);
         if (wrote.is_err()) {
             up_pool.release(nullptr);
-            if (attempt == 0) continue; // retry with fresh connection
+            if (attempt == 0) {
+                continue;
+            }
             return Result<std::vector<unsigned char>>::err(wrote.error());
         }
         auto response = read_response(conn->fd.get(), 5000);
         if (response.is_err()) {
             up_pool.release(nullptr);
-            if (attempt == 0) continue; // retry with fresh connection
+            if (attempt == 0) {
+                continue;
+            }
             return response;
         }
         conn->request_count++;
@@ -281,10 +448,11 @@ Result<void> ProxyServer::setup_listeners() {
         tls_addr.sin_port = htons(cfg_.tls_port);
         if (::inet_pton(AF_INET, cfg_.listen_addr.c_str(), &tls_addr.sin_addr) != 1) {
             LOG_ERROR("invalid listen_addr for TLS, inet_pton failed", "addr", cfg_.listen_addr);
-            return Result<void>::err(
-                Error::from_code(ErrCode::SysError, "invalid TLS listen address: " + cfg_.listen_addr));
+            return Result<void>::err(Error::from_code(
+                ErrCode::SysError, "invalid TLS listen address: " + cfg_.listen_addr));
         }
-        if (::bind(tls_listen_fd_.get(), reinterpret_cast<sockaddr*>(&tls_addr), sizeof(tls_addr)) < 0) {
+        if (::bind(tls_listen_fd_.get(), reinterpret_cast<sockaddr*>(&tls_addr), sizeof(tls_addr)) <
+            0) {
             return Result<void>::err(Error::from_errno("bind tls listen"));
         }
         if (::listen(tls_listen_fd_.get(), SOMAXCONN) < 0) {
@@ -345,14 +513,15 @@ void ProxyServer::on_client_event(int fd, Event events) {
         return;
     }
     auto& conn = *it->second;
-    
+
     if (conn.state == ConnState::TLSHandshake) {
         if (has(events, Event::Read)) {
             unsigned char tmp[8192];
             for (;;) {
                 const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
                 if (n > 0) {
-                    (void)conn.tls_conn->feed_encrypted(std::span<const unsigned char>(tmp, static_cast<size_t>(n)));
+                    (void)conn.tls_conn->feed_encrypted(
+                        std::span<const unsigned char>(tmp, static_cast<size_t>(n)));
                 } else if (n == 0) {
                     close_conn(fd, "eof in handshake");
                     return;
@@ -365,23 +534,10 @@ void ProxyServer::on_client_event(int fd, Event events) {
             }
         }
         auto state_res = conn.tls_conn->do_handshake();
-        unsigned char out_tmp[8192];
-        for (;;) {
-            auto out_res = conn.tls_conn->take_encrypted(out_tmp);
-            if (out_res.is_err() || out_res.value() == 0) break;
-            size_t off = 0;
-            while (off < out_res.value()) {
-                ssize_t sent = ::send(fd, out_tmp + off, out_res.value() - off, 0);
-                if (sent > 0) {
-                    off += static_cast<size_t>(sent);
-                } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    // For simplicity, we assume we can write everything in the handshake.
-                    break;
-                } else {
-                    close_conn(fd, "send error in handshake");
-                    return;
-                }
-            }
+        auto flushed = flush_tls_ciphertext(conn, fd);
+        if (flushed.is_err() && !is_would_block(flushed.error())) {
+            close_conn(fd, "send error in handshake: " + flushed.error().to_string());
+            return;
         }
         if (state_res.is_err()) {
             close_conn(fd, "tls handshake error: " + state_res.error().to_string());
@@ -398,28 +554,15 @@ void ProxyServer::on_client_event(int fd, Event events) {
         }
         return; // Handshake takes precedence
     }
-    
+
     if (has(events, Event::Read)) {
-        unsigned char tmp[8192];
-        for (;;) {
-            const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-            if (n > 0) {
-                auto appended =
-                    conn.rbuf.append(std::span<const unsigned char>(tmp, static_cast<size_t>(n)));
-                if (appended.is_err()) {
-                    close_conn(fd, "read buffer overflow");
-                    return;
-                }
-                continue;
-            }
-            if (n == 0) {
-                close_conn(fd, "eof");
-                return;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            close_conn(fd, "recv error");
+        auto read = read_client_input(conn, fd);
+        if (read.is_err()) {
+            close_conn(fd, "recv error: " + read.error().to_string());
+            return;
+        }
+        if (read.value()) {
+            close_conn(fd, "eof");
             return;
         }
 
@@ -436,6 +579,16 @@ void ProxyServer::on_client_event(int fd, Event events) {
             return;
         }
         if (parsed == ParseResult::Complete) {
+            if (req.chunked) {
+                static constexpr std::string_view unsupported =
+                    "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: "
+                    "close\r\n\r\n";
+                (void)conn.wbuf.append(unsupported);
+                conn.keep_alive = false;
+                conn.rbuf.commit_read(req.header_bytes);
+                (void)loop_->modify(fd, Event::Read | Event::Write, &conn);
+                return;
+            }
             const size_t buffered_body = conn.rbuf.readable() > req.header_bytes
                                              ? conn.rbuf.readable() - req.header_bytes
                                              : 0;
@@ -477,17 +630,12 @@ void ProxyServer::on_client_event(int fd, Event events) {
         }
     }
     if (has(events, Event::Write)) {
-        while (conn.wbuf.readable() > 0) {
-            const auto bytes = conn.wbuf.peek(conn.wbuf.readable());
-            const ssize_t n = ::send(fd, bytes.data(), bytes.size(), 0);
-            if (n > 0) {
-                conn.wbuf.commit_read(static_cast<size_t>(n));
-                continue;
-            }
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                return;
-            }
-            close_conn(fd, "send error");
+        auto wrote = write_client_output(conn, fd);
+        if (wrote.is_err() && is_would_block(wrote.error())) {
+            return;
+        }
+        if (wrote.is_err()) {
+            close_conn(fd, "send error: " + wrote.error().to_string());
             return;
         }
         if (!conn.keep_alive) {
@@ -530,10 +678,13 @@ void ProxyServer::handle_h2_client(ClientConn& conn, int fd) {
         HttpRequest req;
         std::string method, path, authority;
         for (const auto& h : headers) {
-            if (h.name == ":method") method = h.value;
-            else if (h.name == ":path") path = h.value;
-            else if (h.name == ":authority") authority = h.value;
-            else if (h.name[0] != ':') {
+            if (h.name == ":method") {
+                method = h.value;
+            } else if (h.name == ":path") {
+                path = h.value;
+            } else if (h.name == ":authority") {
+                authority = h.value;
+            } else if (!h.name.empty() && h.name[0] != ':') {
                 req.headers.push_back(HttpHeader{h.name, h.value});
             }
         }
@@ -577,7 +728,9 @@ void ProxyServer::handle_h2_client(ClientConn& conn, int fd) {
                     for (const auto& h : resp.headers) {
                         // Skip hop-by-hop headers
                         std::string lname(h.name);
-                        for (auto& c : lname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        for (auto& c : lname) {
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        }
                         if (lname == "connection" || lname == "keep-alive" ||
                             lname == "transfer-encoding" || lname == "upgrade") {
                             continue;
@@ -585,13 +738,12 @@ void ProxyServer::handle_h2_client(ClientConn& conn, int fd) {
                         resp_headers.push_back({std::string(h.name), std::string(h.value)});
                     }
                     size_t body_offset = resp.header_bytes;
-                    size_t body_len = resp_bytes.size() > body_offset
-                                          ? resp_bytes.size() - body_offset
-                                          : 0;
-                    auto resp_body = std::span<const unsigned char>(
-                        resp_bytes.data() + body_offset, body_len);
-                    (void)conn.h2conn->send_response(stream_id, std::move(resp_headers),
-                                                     resp_body, true);
+                    size_t body_len =
+                        resp_bytes.size() > body_offset ? resp_bytes.size() - body_offset : 0;
+                    auto resp_body =
+                        std::span<const unsigned char>(resp_bytes.data() + body_offset, body_len);
+                    (void)conn.h2conn->send_response(stream_id, std::move(resp_headers), resp_body,
+                                                     true);
                 } else {
                     std::vector<HpackHeader> resp_headers;
                     resp_headers.push_back({":status", "502"});

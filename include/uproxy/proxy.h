@@ -48,6 +48,7 @@ struct ClientConn {
     uint64_t request_at_ms{0};
     std::string remote_addr;
     std::unique_ptr<TLSConn> tls_conn;
+    RingBuffer tls_pending{65536};
 };
 
 class ProxyServer {

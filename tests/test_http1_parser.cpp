@@ -2,6 +2,8 @@
 
 #include "test_util.h"
 
+#include <string>
+
 using namespace uproxy;
 
 int main_http1_tests() {
@@ -21,6 +23,20 @@ int main_http1_tests() {
                       "chunked\r\n\r\n")
               .is_ok());
     check(parser.parse_request(smuggle, req) == ParseResult::Error);
+
+    HttpRequest h2_translated;
+    h2_translated.method = "POST";
+    h2_translated.target = "/submit";
+    h2_translated.version = "HTTP/1.1";
+    h2_translated.content_length = 5;
+    h2_translated.headers.push_back({"user-agent", "uproxy-test"});
+    RingBuffer serialized(1024);
+    Http1Serializer serializer;
+    check(serializer.write_request(serialized, h2_translated, "127.0.0.1:3000").is_ok());
+    const auto serialized_bytes = serialized.peek(serialized.readable());
+    const std::string serialized_text(reinterpret_cast<const char*>(serialized_bytes.data()),
+                                      serialized_bytes.size());
+    check(serialized_text.find("Content-Length: 5\r\n") != std::string::npos);
 
     RingBuffer bare_lf(1024);
     check(bare_lf.append("GET / HTTP/1.1\nHost: x\n\n").is_ok());

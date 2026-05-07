@@ -6,7 +6,7 @@ compile_commands.json
 *.o
 *.a
 *.dSYM/
-uproxy
+/uproxy
 tests/run_tests
 coverage.out
 *.profraw
@@ -21,4 +21,3 @@ credentials.json
 node_modules/
 dist/
 target/
-

@@ -27,9 +27,10 @@ class EpollLoop final : public EventLoop {
     EpollLoop() : epfd_(::epoll_create1(EPOLL_CLOEXEC)) {}
 
     Result<void> add(int fd, Event events, void* user_data) override {
+        (void)user_data;
         epoll_event ev{};
         ev.events = to_epoll(events);
-        ev.data.ptr = user_data;
+        ev.data.fd = fd;
         if (::epoll_ctl(epfd_.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
             return Result<void>::err(Error::from_errno("epoll add"));
         }
@@ -37,9 +38,10 @@ class EpollLoop final : public EventLoop {
     }
 
     Result<void> modify(int fd, Event events, void* user_data) override {
+        (void)user_data;
         epoll_event ev{};
         ev.events = to_epoll(events);
-        ev.data.ptr = user_data;
+        ev.data.fd = fd;
         if (::epoll_ctl(epfd_.get(), EPOLL_CTL_MOD, fd, &ev) < 0) {
             return Result<void>::err(Error::from_errno("epoll mod"));
         }
@@ -63,7 +65,7 @@ class EpollLoop final : public EventLoop {
             return Result<void>::err(Error::from_errno("epoll wait"));
         }
         for (int i = 0; i < n; ++i) {
-            const int fd = static_cast<int>(reinterpret_cast<intptr_t>(events[i].data.ptr));
+            const int fd = events[i].data.fd;
             auto timer_it = timer_fd_to_id_.find(fd);
             if (timer_it != timer_fd_to_id_.end()) {
                 uint64_t expirations = 0;
@@ -77,7 +79,7 @@ class EpollLoop final : public EventLoop {
                 }
                 continue;
             }
-            cb(FiredEvent{fd, from_epoll(events[i].events), events[i].data.ptr});
+            cb(FiredEvent{fd, from_epoll(events[i].events), nullptr});
         }
         return Result<void>::ok();
     }
@@ -97,7 +99,7 @@ class EpollLoop final : public EventLoop {
         const int fd = tfd.get();
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLET;
-        ev.data.ptr = reinterpret_cast<void*>(static_cast<intptr_t>(fd));
+        ev.data.fd = fd;
         if (::epoll_ctl(epfd_.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
             return Result<uint64_t>::err(Error::from_errno("epoll add timer"));
         }

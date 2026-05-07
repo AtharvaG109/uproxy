@@ -109,21 +109,24 @@ Result<void> encode_int(uint64_t value, int prefix_bits, unsigned char prefix, R
 
 Result<void> encode_string(std::string_view s, RingBuffer& out) {
     size_t huffman_len = 0;
-    for (unsigned char c : s) {
+    for (char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
         huffman_len += HPACK_HUFFMAN_SYM_TABLE[c].nbits;
     }
     const size_t huffman_bytes = (huffman_len + 7) / 8;
-    
+
     if (huffman_bytes < s.size()) {
         auto r = encode_int(huffman_bytes, 7, 0x80, out);
-        if (r.is_err()) return r;
-        
+        if (r.is_err())
+            return r;
+
         uint64_t bit_buf = 0;
         int bit_len = 0;
         std::vector<unsigned char> enc;
         enc.reserve(huffman_bytes);
-        
-        for (unsigned char c : s) {
+
+        for (char ch : s) {
+            const auto c = static_cast<unsigned char>(ch);
             const auto& sym = HPACK_HUFFMAN_SYM_TABLE[c];
             uint32_t code = sym.code >> (32 - sym.nbits);
             bit_buf = (bit_buf << sym.nbits) | code;
@@ -141,8 +144,10 @@ Result<void> encode_string(std::string_view s, RingBuffer& out) {
         return out.append(std::span<const unsigned char>(enc));
     } else {
         auto r = encode_int(s.size(), 7, 0x00, out);
-        if (r.is_err()) return r;
-        return out.append(std::span<const unsigned char>(reinterpret_cast<const unsigned char*>(s.data()), s.size()));
+        if (r.is_err())
+            return r;
+        return out.append(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(s.data()), s.size()));
     }
 }
 
@@ -321,41 +326,46 @@ Result<std::string> HpackDecoder::decode_string(std::span<const unsigned char>& 
                 const auto& sym = HPACK_HUFFMAN_SYM_TABLE[i];
                 int node = 0;
                 uint32_t code = sym.code >> (32 - sym.nbits);
-                for (int b = sym.nbits - 1; b >= 0; --b) {
+                for (int b = static_cast<int>(sym.nbits) - 1; b >= 0; --b) {
                     int bit = (code >> b) & 1;
+                    const auto node_index = static_cast<size_t>(node);
                     if (bit == 0) {
-                        if (tree[node].left == -1) {
-                            tree[node].left = static_cast<int>(tree.size());
+                        if (tree[node_index].left == -1) {
+                            tree[node_index].left = static_cast<int>(tree.size());
                             tree.emplace_back();
                         }
-                        node = tree[node].left;
+                        node = tree[node_index].left;
                     } else {
-                        if (tree[node].right == -1) {
-                            tree[node].right = static_cast<int>(tree.size());
+                        if (tree[node_index].right == -1) {
+                            tree[node_index].right = static_cast<int>(tree.size());
                             tree.emplace_back();
                         }
-                        node = tree[node].right;
+                        node = tree[node_index].right;
                     }
                 }
-                tree[node].sym = i;
+                tree[static_cast<size_t>(node)].sym = i;
             }
         }
-        
+
         std::string out;
         int node = 0;
         for (size_t i = 0; i < len.value(); ++i) {
             unsigned char b = data[i];
             for (int bit = 7; bit >= 0; --bit) {
                 int b_val = (b >> bit) & 1;
-                node = (b_val == 0) ? tree[node].left : tree[node].right;
+                const auto node_index = static_cast<size_t>(node);
+                node = (b_val == 0) ? tree[node_index].left : tree[node_index].right;
                 if (node == -1) {
-                    return Result<std::string>::err(Error::from_code(ErrCode::HpackError, "invalid Huffman code"));
+                    return Result<std::string>::err(
+                        Error::from_code(ErrCode::HpackError, "invalid Huffman code"));
                 }
-                if (tree[node].sym != -1) {
-                    if (tree[node].sym == 256) {
-                        return Result<std::string>::err(Error::from_code(ErrCode::HpackError, "EOS symbol in Huffman"));
+                const auto next_node_index = static_cast<size_t>(node);
+                if (tree[next_node_index].sym != -1) {
+                    if (tree[next_node_index].sym == 256) {
+                        return Result<std::string>::err(
+                            Error::from_code(ErrCode::HpackError, "EOS symbol in Huffman"));
                     }
-                    out.push_back(static_cast<char>(tree[node].sym));
+                    out.push_back(static_cast<char>(tree[next_node_index].sym));
                     node = 0;
                 }
             }

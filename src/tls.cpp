@@ -4,8 +4,8 @@
 #include <deque>
 
 #if defined(UPROXY_HAS_BORINGSSL)
-#include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/ssl.h>
 #endif
 
 namespace uproxy {
@@ -18,7 +18,9 @@ struct TLSContextImpl {
     SSL_CTX* ssl_ctx{nullptr};
 
     ~TLSContextImpl() {
-        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+        if (ssl_ctx) {
+            SSL_CTX_free(ssl_ctx);
+        }
     }
 };
 
@@ -31,7 +33,9 @@ struct TLSConnImpl {
     std::string alpn{"http/1.1"};
 
     ~TLSConnImpl() {
-        if (ssl) SSL_free(ssl);
+        if (ssl) {
+            SSL_free(ssl);
+        }
     }
 };
 
@@ -44,10 +48,16 @@ static int alpn_select_cb(SSL* ssl, const unsigned char** out, unsigned char* ou
     for (unsigned int i = 0; i < inlen;) {
         unsigned int len = in[i];
         i++;
-        if (i + len > inlen) break;
+        if (i + len > inlen) {
+            break;
+        }
         std::string_view proto(reinterpret_cast<const char*>(in + i), len);
-        if (proto == "h2") has_h2 = true;
-        if (proto == "http/1.1") has_h1 = true;
+        if (proto == "h2") {
+            has_h2 = true;
+        }
+        if (proto == "http/1.1") {
+            has_h1 = true;
+        }
         i += len;
     }
     if (has_h2) {
@@ -81,13 +91,16 @@ Result<TLSContext> TLSContext::server(const TLSConfig& cfg) {
     }
 
     if (SSL_CTX_use_certificate_chain_file(impl->ssl_ctx, cfg.cert_file.c_str()) != 1) {
-        return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Failed to load cert_file"));
+        return Result<TLSContext>::err(
+            Error::from_code(ErrCode::ConfigInvalid, "Failed to load cert_file"));
     }
     if (SSL_CTX_use_PrivateKey_file(impl->ssl_ctx, cfg.key_file.c_str(), SSL_FILETYPE_PEM) != 1) {
-        return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Failed to load key_file"));
+        return Result<TLSContext>::err(
+            Error::from_code(ErrCode::ConfigInvalid, "Failed to load key_file"));
     }
     if (SSL_CTX_check_private_key(impl->ssl_ctx) != 1) {
-        return Result<TLSContext>::err(Error::from_code(ErrCode::ConfigInvalid, "Private key does not match certificate"));
+        return Result<TLSContext>::err(
+            Error::from_code(ErrCode::ConfigInvalid, "Private key does not match certificate"));
     }
 
     SSL_CTX_set_alpn_select_cb(impl->ssl_ctx, alpn_select_cb, nullptr);
@@ -109,7 +122,7 @@ TLSConn::TLSConn(TLSContextImpl* ctx, bool is_server)
     : impl_(std::make_unique<TLSConnImpl>()), handshake_done_(!is_server) {
     impl_->ctx = ctx;
     impl_->server = is_server;
-    
+
     if (ctx && ctx->ssl_ctx) {
         impl_->ssl = SSL_new(ctx->ssl_ctx);
         impl_->read_bio = BIO_new(BIO_s_mem());
@@ -154,13 +167,18 @@ Result<TLSHandshakeState> TLSConn::do_handshake() {
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
         return Result<TLSHandshakeState>::ok(TLSHandshakeState::Pending);
     }
-    
-    return Result<TLSHandshakeState>::err(Error::from_code(ErrCode::TlsHandshake, "TLS handshake failed"));
+
+    return Result<TLSHandshakeState>::err(
+        Error::from_code(ErrCode::TlsHandshake, "TLS handshake failed"));
 }
 
 Result<void> TLSConn::feed_encrypted(std::span<const unsigned char> data) {
-    if (!impl_->ssl) return Result<void>::ok();
-    if (data.empty()) return Result<void>::ok();
+    if (!impl_->ssl) {
+        return Result<void>::ok();
+    }
+    if (data.empty()) {
+        return Result<void>::ok();
+    }
     int ret = BIO_write(impl_->read_bio, data.data(), static_cast<int>(data.size()));
     if (ret <= 0) {
         return Result<void>::err(Error::from_code(ErrCode::SysError, "BIO_write failed"));
@@ -169,17 +187,27 @@ Result<void> TLSConn::feed_encrypted(std::span<const unsigned char> data) {
 }
 
 Result<size_t> TLSConn::take_encrypted(std::span<unsigned char> out) {
-    if (!impl_->ssl) return Result<size_t>::ok(0);
+    if (!impl_->ssl) {
+        return Result<size_t>::ok(0);
+    }
     int ret = BIO_read(impl_->write_bio, out.data(), static_cast<int>(out.size()));
-    if (ret > 0) return Result<size_t>::ok(static_cast<size_t>(ret));
-    if (BIO_should_retry(impl_->write_bio)) return Result<size_t>::ok(0);
+    if (ret > 0) {
+        return Result<size_t>::ok(static_cast<size_t>(ret));
+    }
+    if (BIO_should_retry(impl_->write_bio)) {
+        return Result<size_t>::ok(0);
+    }
     return Result<size_t>::err(Error::from_code(ErrCode::SysError, "BIO_read failed"));
 }
 
 Result<size_t> TLSConn::read(std::span<unsigned char> out) {
-    if (!impl_->ssl) return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "no mock data"));
-    if (!handshake_done_) return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "handshake pending"));
-    
+    if (!impl_->ssl) {
+        return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "no mock data"));
+    }
+    if (!handshake_done_) {
+        return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "handshake pending"));
+    }
+
     int ret = SSL_read(impl_->ssl, out.data(), static_cast<int>(out.size()));
     if (ret > 0) {
         return Result<size_t>::ok(static_cast<size_t>(ret));
@@ -192,9 +220,13 @@ Result<size_t> TLSConn::read(std::span<unsigned char> out) {
 }
 
 Result<size_t> TLSConn::write(std::span<const unsigned char> data) {
-    if (!impl_->ssl) return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "no mock data"));
-    if (!handshake_done_) return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "handshake pending"));
-    
+    if (!impl_->ssl) {
+        return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "no mock data"));
+    }
+    if (!handshake_done_) {
+        return Result<size_t>::err(Error::from_code(ErrCode::WouldBlock, "handshake pending"));
+    }
+
     int ret = SSL_write(impl_->ssl, data.data(), static_cast<int>(data.size()));
     if (ret > 0) {
         return Result<size_t>::ok(static_cast<size_t>(ret));
@@ -211,7 +243,9 @@ bool TLSConn::want_read() const noexcept {
 }
 
 bool TLSConn::want_write() const noexcept {
-    if (!impl_ || !impl_->ssl) return false;
+    if (!impl_ || !impl_->ssl) {
+        return false;
+    }
     return BIO_pending(impl_->write_bio) > 0;
 }
 
