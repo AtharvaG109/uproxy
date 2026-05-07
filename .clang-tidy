@@ -1,14 +1,9 @@
 Checks: >
+  -*,
   bugprone-*,
   clang-analyzer-*,
-  cppcoreguidelines-*,
   performance-*,
-  portability-*,
-  readability-*,
-  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
-  -cppcoreguidelines-avoid-magic-numbers,
-  -readability-magic-numbers
+  portability-*
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*'
 FormatStyle: file
-
