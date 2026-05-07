@@ -121,6 +121,8 @@ ParseResult parse_headers(std::string_view bytes, HttpRequest* req, HttpResponse
         resp->content_length = 0;
         resp->chunked = false;
         resp->header_bytes = end + 4;
+    } else {
+        return ParseResult::Error;
     }
 
     bool saw_content_length = false;
