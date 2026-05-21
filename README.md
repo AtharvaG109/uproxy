@@ -37,6 +37,10 @@ make test
 make
 ```
 
+## Architecture Notes
+
+See `docs/architecture.md` for the validated request path, release boundaries, and proof gates.
+
 ## Run
 
 ```bash
