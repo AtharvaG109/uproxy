@@ -41,6 +41,8 @@ make
 
 See `docs/architecture.md` for the validated request path, release boundaries, and proof gates.
 
+For release-focused validation, use [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md). It covers local gates, sanitizer checks, submodule hygiene, and conservative readiness wording.
+
 ## Run
 
 ```bash

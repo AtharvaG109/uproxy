@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest a uproxy networking or validation improvement.
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What proxy, protocol, or operational workflow would this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: proof
+    attributes:
+      label: Proof gates
+      description: What tests, benchmarks, or traffic-path checks should prove it?
+    validations:
+      required: true
